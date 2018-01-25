@@ -21,13 +21,31 @@ _no_invalidation_depth = defaultdict(int)
 
 @handle_connection_failure
 def invalidate_dict(model, obj_dict):
-    if no_invalidation.active:
-        return
-    model = non_proxy(model)
-    load_script('invalidate')(args=[
-        model._meta.db_table,
-        json.dumps(obj_dict, default=str)
-    ])
+
+    def _invalidate(model):
+        # TODO: Do we need to get `obj_dict` again for every MTI parent or child
+        #       model?
+        if no_invalidation.active:
+            return
+        model = non_proxy(model)
+        load_script('invalidate')(args=[
+            model._meta.db_table,
+            json.dumps(obj_dict, default=str)
+        ])
+
+    def _invalidate_children(model):
+        # Iterate related objects, looking for MTI child models.
+        for ro in model._meta.get_all_related_objects():
+            # If the model is a parent of the related object model, then it must
+            # be an MTI child.
+            if model in ro.opts.parents:
+                _invalidate(ro.model)
+                _invalidate_children(ro.model)  # Recurse
+
+    _invalidate(model)
+    _invalidate_children(model)
+    for parent in model._meta.parents.keys():
+        _invalidate(parent)
 
 def invalidate_obj(obj):
     """
@@ -43,13 +61,33 @@ def invalidate_model(model):
     NOTE: This is a heavy artilery which uses redis KEYS request,
           which could be relatively slow on large datasets.
     """
-    if no_invalidation.active:
-        return
-    model = non_proxy(model)
-    conjs_keys = redis_client.keys('conj:%s:*' % model._meta.db_table)
-    if conjs_keys:
-        cache_keys = redis_client.sunion(conjs_keys)
-        redis_client.delete(*(list(cache_keys) + conjs_keys))
+    def _invalidate(model):
+        if no_invalidation.active:
+            return
+        model = non_proxy(model)
+        conjs_keys = redis_client.keys('conj:%s:*' % model._meta.db_table)
+        if conjs_keys:
+            cache_keys = redis_client.sunion(conjs_keys)
+            redis_client.delete(*(list(cache_keys) + conjs_keys))
+
+    def _invalidate_children(model):
+        # Iterate related objects, looking for MTI child models.
+        for ro in model._meta.get_all_related_objects():
+            # If the model is a parent of the related object model, then it must
+            # be an MTI child.
+            if model in ro.opts.parents:
+                _invalidate(ro.model)
+                _invalidate_children(ro.model)  # Recurse
+
+    _invalidate(model)
+    _invalidate_children(model)
+    for parent in model._meta.parents.keys():
+        # TODO: Only invalidate parent instances that have corresponding child
+        #       instances. E.g. `Parent.objects.get(pk__in=Child.objects.all())`
+        #       If so, we will need to stash deleted MTI parent and child
+        #       instances in a `pre_delete` signal handler, so we can invalidate
+        #       them in `post_delete`.
+        _invalidate(parent)
 
 @handle_connection_failure
 def invalidate_all():

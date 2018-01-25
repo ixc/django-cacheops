@@ -379,7 +379,8 @@ class ManagerMixin(object):
     def _pre_save(self, sender, instance, **kwargs):
         if instance.pk is not None:
             try:
-                _old_objs[get_thread_id(), sender, instance.pk] = sender.objects.get(pk=instance.pk)
+                _old_objs[get_thread_id(), sender, instance.pk] = \
+                    sender.objects.get(pk=instance.pk)
             except sender.DoesNotExist:
                 pass
 
