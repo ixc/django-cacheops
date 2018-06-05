@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+from contextlib import contextmanager
 from copy import deepcopy
 import warnings
 import six
@@ -11,11 +12,14 @@ from django.core.exceptions import ImproperlyConfigured
 
 ALL_OPS = ('get', 'fetch', 'count', 'exists')
 
+LOCK_TIMEOUT = 60
+
 
 profile_defaults = {
     'ops': (),
     'local_get': False,
     'db_agnostic': True,
+    'lock': False,
 }
 # NOTE: this is a compatibility for old style config,
 # TODO: remove in cacheops 3.0
@@ -46,8 +50,56 @@ if DEGRADE_ON_FAILURE:
 else:
     handle_connection_failure = identity
 
-class SafeRedis(redis.StrictRedis):
+class CacheopsRedis(redis.StrictRedis):
     get = handle_connection_failure(redis.StrictRedis.get)
+
+    @contextmanager
+    def getting(self, key, lock=False):
+        if not lock:
+            yield self.get(key)
+        else:
+            locked = False
+            try:
+                data = self._get_or_lock(key)
+                locked = data is None
+                yield data
+            finally:
+                if locked:
+                    self._release_lock(key)
+
+    @handle_connection_failure
+    def _get_or_lock(self, key):
+        self._lock = getattr(self, '_lock', self.register_script("""
+            local locked = redis.call('set', KEYS[1], 'LOCK', 'nx', 'ex', ARGV[1])
+            if locked then
+                redis.call('del', KEYS[2])
+            end
+            return locked
+        """))
+        signal_key = key + ':signal'
+
+        while True:
+            data = self.get(key)
+            if data is None:
+                if self._lock(keys=[key, signal_key], args=[LOCK_TIMEOUT]):
+                    return None
+            elif data != 'LOCK':
+                return data
+
+            # No data and not locked, wait
+            self.brpoplpush(signal_key, signal_key, timeout=LOCK_TIMEOUT)
+
+    @handle_connection_failure
+    def _release_lock(self, key):
+        self._unlock = getattr(self, '_unlock', self.register_script("""
+            if redis.call('get', KEYS[1]) == 'LOCK' then
+                redis.del(KEYS[1])
+            end
+            redis.call('lpush', KEYS[2], 1)
+            redis.call('expire', KEYS[2], 1)
+        """))
+        signal_key = key + ':signal'
+        self._unlock(keys=[key, signal_key])
 
 
 class LazyRedis(object):
@@ -58,7 +110,7 @@ class LazyRedis(object):
         except AttributeError:
             raise ImproperlyConfigured('You must specify CACHEOPS_REDIS setting to use cacheops')
 
-        client = (SafeRedis if DEGRADE_ON_FAILURE else redis.StrictRedis)(**redis_conf)
+        client = CacheopsRedis(**redis_conf)
 
         object.__setattr__(self, '__class__', client.__class__)
         object.__setattr__(self, '__dict__', client.__dict__)

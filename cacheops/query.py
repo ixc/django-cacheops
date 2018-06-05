@@ -54,6 +54,7 @@ def cached_as(*samples, **kwargs):
     timeout = kwargs.get('timeout')
     extra = kwargs.get('extra')
     key_func = kwargs.get('key_func', func_cache_key)
+    lock = kwargs.get('lock')
 
     # If we unexpectedly get list instead of queryset return identity decorator.
     # Paginator could do this when page.object_list is empty.
@@ -79,19 +80,21 @@ def cached_as(*samples, **kwargs):
     key_extra.append(extra)
     if not timeout:
         timeout = min(qs._cacheconf['timeout'] for qs in querysets)
+    if lock is None:
+        lock = any(qs._cacheconf['lock'] for qs in querysets)
 
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
             cache_key = 'as:' + key_func(func, args, kwargs, key_extra)
 
-            cache_data = redis_client.get(cache_key)
-            if cache_data is not None:
-                return pickle.loads(cache_data)
-
-            result = func(*args, **kwargs)
-            cache_thing(cache_key, result, cond_dnfs, timeout)
-            return result
+            with redis_client.getting(cache_key, lock=lock) as cache_data:
+                if cache_data is not None:
+                    return pickle.loads(cache_data)
+                else:
+                    result = func(*args, **kwargs)
+                    cache_thing(cache_key, result, cond_dnfs, timeout)
+                    return result
 
         return wrapper
     return decorator
@@ -161,13 +164,14 @@ class QuerySetMixin(object):
         cond_dnfs = dnfs(self)
         cache_thing(cache_key, results, cond_dnfs, self._cacheconf['timeout'])
 
-    def cache(self, ops=None, timeout=None, write_only=None):
+    def cache(self, ops=None, timeout=None, write_only=None, lock=None):
         """
         Enables caching for given ops
             ops        - a subset of {'get', 'fetch', 'count', 'exists'},
                          ops caching to be turned on, all enabled by default
             timeout    - override default cache timeout
             write_only - don't try fetching from cache, still write result there
+            lock       - use lock to prevent dog-pile effect
 
         NOTE: you actually can disable caching by omiting corresponding ops,
               .cache(ops=[]) disables caching for this queryset.
@@ -184,6 +188,8 @@ class QuerySetMixin(object):
             self._cacheconf['timeout'] = timeout
         if write_only is not None:
             self._cacheconf['write_only'] = write_only
+        if lock is not None:
+            self._cacheconf['lock'] = lock
 
         return self
 
@@ -272,6 +278,28 @@ class QuerySetMixin(object):
         if cache_this:
             self._cache_results(cache_key, results)
         raise StopIteration
+
+    def _fetch_all(self):
+        # If cache is not enabled just fall back
+        if not self._cacheconf or 'fetch' not in self._cacheconf['ops']:
+            return self._no_monkey._fetch_all(self)
+
+        if self._result_cache is None:
+            cache_key = self._cache_key()
+            lock = self._cacheprofile['lock']
+
+            if self._cacheconf['write_only'] or self._for_write:
+                self._result_cache = list(self._no_monkey.iterator(self))
+                self._cache_results(cache_key, self._result_cache)
+            else:
+                with redis_client.getting(cache_key, lock=lock) as cache_data:
+                    if cache_data is not None:
+                        self._result_cache = pickle.loads(cache_data)
+                    else:
+                        self._result_cache = list(self._no_monkey.iterator(self))
+                        self._cache_results(cache_key, self._result_cache)
+
+        self._no_monkey._fetch_all(self)
 
     def count(self):
         if self._cacheprofile and 'count' in self._cacheconf['ops']:
