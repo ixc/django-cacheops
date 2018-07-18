@@ -19,6 +19,7 @@ profile_defaults = {
     'ops': (),
     'local_get': False,
     'db_agnostic': True,
+    'write_only': False,
     'lock': False,
 }
 # NOTE: this is a compatibility for old style config,
