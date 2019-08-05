@@ -8,6 +8,8 @@ from funcy import wraps
 from .conf import redis_client, handle_connection_failure
 from .utils import func_cache_key, cached_view_fab
 
+from djangosite.ddtrace import conditional_tracer
+
 
 __all__ = ('cache', 'cached', 'cached_view', 'file_cache', 'CacheMiss', 'FileCache', 'RedisCache')
 
@@ -46,6 +48,7 @@ class BaseCache(object):
 
         return result
 
+    @conditional_tracer.wrap()
     def cached(self, timeout=None, extra=None, key_func=func_cache_key):
         """
         A decorator for caching function calls

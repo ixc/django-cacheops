@@ -25,6 +25,8 @@ from .utils import monkey_mix, get_model_name, stamp_fields, load_script, \
 from .tree import dnfs
 from .invalidation import invalidate_obj, invalidate_dict
 
+from djangosite.ddtrace import conditional_tracer
+
 
 __all__ = ('cached_as', 'cached_view_as', 'install_cacheops')
 
@@ -46,6 +48,7 @@ def cache_thing(cache_key, data, cond_dnfs, timeout):
     )
 
 
+@conditional_tracer.wrap()
 def cached_as(*samples, **kwargs):
     """
     Caches results of a function and invalidates them same way as given queryset.
